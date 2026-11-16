@@ -76,7 +76,10 @@ class RestoreRequest(BaseModel):
     )
     overwrite: bool = Field(
         default=False,
-        description="Atomically replace an existing target file (the old file is kept on failure).",
+        description=(
+            "Atomically replace an existing target file. The previous version "
+            "stays readable until the swap and is preserved on any failure."
+        ),
     )
 
 
@@ -138,6 +141,7 @@ def create_app(
         manager.ensure_dirs()
         restores.mkdir(parents=True, exist_ok=True)
         manager.recover_incomplete()
+        BackupManager.cleanup_restore_staging(restores)
         yield
 
     app = FastAPI(
@@ -299,8 +303,11 @@ def create_app(
         summary="Restore a backup into an independent target database",
         description=(
             "Verifies manifest, SHA-256 and SQLite integrity before touching the target. "
-            "The target is swapped in atomically only after the restored copy verifies; "
-            "on any failure the existing target is preserved and the source stays writable."
+            "The new version is prepared and re-verified in a private staging directory, "
+            "then published with a single atomic rename. Restores to the same target are "
+            "serialised: each success publishes one complete version, a failed restore "
+            "never removes or rolls back a version another request published, and the "
+            "target never disappears for readers. The source stays writable."
         ),
     )
     def restore_backup(backup_id: str, request: RestoreRequest) -> RestoreResultView:
@@ -319,6 +326,10 @@ def create_app(
         except RestoreError as exc:
             raise HTTPException(
                 status_code=422, detail=f"restore failed, target untouched: {exc}"
+            ) from exc
+        except (sqlite3.Error, OSError) as exc:
+            raise HTTPException(
+                status_code=500, detail=f"restore failed, target untouched: {exc}"
             ) from exc
         return RestoreResultView(
             backup_id=result.backup_id,

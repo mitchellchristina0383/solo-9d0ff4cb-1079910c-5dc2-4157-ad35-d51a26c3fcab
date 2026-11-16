@@ -73,10 +73,20 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
   appends.  The source is a normal WAL database and stays writable.
 * **Verified restore.**  `POST /backups/{id}/restore` re-verifies the manifest
   hash, the database hash and `integrity_check` *before* touching the target.
-  The restored copy is prepared and hashed in a private temp directory, then
-  renamed into place.  An existing target (when `overwrite=true`) is moved
-  aside first and put back on any failure, so the previous target survives
-  bit-for-bit.
+  The restored copy is prepared and re-verified in a private staging
+  directory, then published with a single atomic `rename(2)`.  The existing
+  target is never moved aside or unmapped: readers see either the old
+  complete version or the new one, and any failure before the rename leaves
+  the previous target byte-identical.
+* **Concurrent restores to the same target.**  Publishes to one target are
+  serialised on a per-target lock and each successful response corresponds to
+  exactly one atomic, complete version swap.  A restore that fails — even
+  after a concurrent restore to the same target has already returned success —
+  only deletes its own private staging directory; it can never delete or roll
+  back a version another request published.  Overwrite therefore never opens
+  a window in which the target is missing or serves mixed log content.
+  Orphaned `.restore-*` staging directories (only possible after a hard
+  crash) are removed at startup.
 * **Independent target.**  Restore writes a separate database file under
   `/data/restores`; later appends to the source and later writes to the target
   are isolated from each other.  The restore endpoint never opens the source
@@ -92,13 +102,18 @@ python -m pytest
 The suite covers concurrent appends during a backup, frozen-snapshot
 behaviour, immutable published backups, independent restore, corrupt-backup
 restore with the target preserved, interrupted backups after restart,
-`ready`-row demotion, backup failure, restart persistence and `/docs`.
+`ready`-row demotion, backup failure, restart persistence, `/docs`, and
+same-target restore concurrency: an interleaved restore failure cannot roll
+back a version another restore already published, readers never see a missing
+or mixed target while overwrites race, a no-overwrite race publishes exactly
+once, and orphaned restore staging directories are cleaned at startup.
 
 ## Notes / limits
 
-* The service is a single process.  `recover_incomplete()` assumes it is the
-  only writer to the backup directory at startup; do not run several API
-  instances against the same `/data` volume.
+* The service is a single process.  `recover_incomplete()` and the restore
+  staging cleanup assume they are the only writer to the backup/restore
+  directories at startup, and restore serialisation uses in-process locks;
+  do not run several API instances against the same `/data` volume.
 * Backup files are hash-checked on every verify/download/restore, which is
   O(backup size).  Fine for job-log volumes; for very large databases this
   should be cached.

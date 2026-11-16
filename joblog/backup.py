@@ -29,10 +29,15 @@ Immutability of published backups
 
 Verified restore to an independent target
     Restore re-verifies manifest + file hashes + integrity before touching the
-    target, materialises a fresh copy in a temporary directory, verifies the
-    copy again, and only then swaps it into place.  The previous target is moved
-    aside first and restored on failure, so a corrupt backup or a restore error
-    leaves the existing target byte-identical.  The source database is never
+    target, materialises a fresh copy in a private staging directory, verifies
+    the copy again, and publishes it with a single atomic ``os.replace``.
+    Publishes to the same target are serialised on a per-target lock, so
+    interleaved restores cannot observe or roll back each other's work: every
+    successful response corresponds to exactly one complete, readable version
+    swap, and a failed restore only ever removes its own private staging
+    directory.  The live target is never unmapped, moved aside or reverted, so
+    readers always see one complete version -- before, during and after an
+    overwrite, and also when a restore fails.  The source database is never
     opened for writing during restore and remains writable throughout.
 """
 
@@ -45,6 +50,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,6 +61,7 @@ from .db import Database
 
 BACKUP_ID_RE = re.compile(r"^bkp-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$")
 STAGING_PREFIX = ".staging-"
+RESTORE_STAGING_PREFIX = ".restore-"
 MANIFEST_NAME = "manifest.json"
 DB_NAME = "joblogs.db"
 FILE_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -197,6 +204,14 @@ class RestoreResult:
 
 
 class BackupManager:
+    # Serialises publishes per restore-target path.  Class-level on purpose:
+    # two manager instances pointed at the same restore directory (e.g. an
+    # old and a restarted app object in one process) still serialise swaps of
+    # the same target file.  Locks are never removed; the number of distinct
+    # target names in one restore directory is small.
+    _target_locks: dict[str, threading.Lock] = {}
+    _target_locks_guard = threading.Lock()
+
     def __init__(self, database: Database, backups_root: Path):
         self.database = database
         self.root = Path(backups_root)
@@ -209,6 +224,16 @@ class BackupManager:
     # ------------------------------------------------------------------ paths
     def _backup_dir(self, backup_id: str) -> Path:
         return self.root / backup_id
+
+    @classmethod
+    def _target_lock(cls, target_path: Path) -> threading.Lock:
+        key = os.path.normpath(os.path.abspath(target_path.as_posix()))
+        with cls._target_locks_guard:
+            lock = cls._target_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._target_locks[key] = lock
+            return lock
 
     def _new_id(self) -> str:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -277,6 +302,31 @@ class BackupManager:
                     )
                 stats["ready_missing"] += 1
         return stats
+
+    @staticmethod
+    def cleanup_restore_staging(restore_dir: Path) -> int:
+        """Delete orphaned restore staging directories in *restore_dir*.
+
+        A restore stages its copy in a private ``.restore-*`` directory next
+        to the target and removes it again on every success and every
+        failure; only a hard crash can leave one behind.  Called at startup,
+        before requests are served, under the same single-writer assumption
+        as :meth:`recover_incomplete`.  Returns the number of entries removed.
+        """
+        removed = 0
+        try:
+            entries = list(restore_dir.iterdir())
+        except FileNotFoundError:
+            return 0
+        for entry in entries:
+            if not entry.name.startswith(RESTORE_STAGING_PREFIX):
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+            removed += 1
+        return removed
 
     # --------------------------------------------------------------- creation
     def create(
@@ -546,9 +596,31 @@ class BackupManager:
 
     # -------------------------------------------------------------- restoring
     def restore(
-        self, backup_id: str, target_path: Path, *, overwrite: bool = False
+        self,
+        backup_id: str,
+        target_path: Path,
+        *,
+        overwrite: bool = False,
+        after_prepare: Callable[[], None] | None = None,
+        before_publish: Callable[[], None] | None = None,
     ) -> RestoreResult:
-        """Restore a published backup into an independent target database."""
+        """Restore a published backup into an independent target database.
+
+        Concurrency contract for restores to the *same* target:
+
+        * a successful response means exactly one complete, verified version
+          was published with a single atomic rename;
+        * a failing restore only ever removes its own private staging
+          directory -- it can never delete, replace or roll back a version
+          that this or another restore already published;
+        * readers always see one complete version: the target path is never
+          unmapped (no gap window) and never half-copied or mixed.
+
+        ``after_prepare`` / ``before_publish`` are internal test hooks invoked
+        after the staged copy is fully verified (before taking the target
+        lock) and inside the lock just before the atomic swap.  They have no
+        effect on the produced target.
+        """
         target_path = Path(target_path)
         if not target_path.is_absolute():
             raise RestoreError("target path must be absolute")
@@ -561,12 +633,15 @@ class BackupManager:
         db_path = self._backup_dir(backup_id) / DB_NAME
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        work_dir = target_path.parent / (f".restore-{backup_id}-{secrets.token_hex(8)}")
+        work_dir = target_path.parent / (
+            f"{RESTORE_STAGING_PREFIX}{backup_id}-{secrets.token_hex(8)}"
+        )
         work_dir.mkdir(parents=True, exist_ok=False)
         new_db = work_dir / "restored.db"
-        moved_aside: list[tuple[Path, Path]] = []
 
         try:
+            # Everything fallible happens on the private staging copy; the
+            # live target is not touched until the atomic publish below.
             shutil.copyfile(db_path, new_db)
             if sha256_file(new_db) != row["db_sha256"]:
                 raise RestoreError("copied database hash mismatch")
@@ -588,56 +663,52 @@ class BackupManager:
             if sha256_file(new_db) != row["db_sha256"]:
                 raise RestoreError("prepared database hash mismatch")
 
-            # Move an existing target (and any sidecars) aside first so that a
-            # failure after this point can restore the original exactly.
-            targets = [target_path] + [
-                target_path.with_name(target_path.name + suffix)
-                for suffix in FILE_SUFFIXES
-            ]
-            for existing in targets:
-                if existing.exists():
-                    aside = work_dir / f"old-{existing.name}"
-                    os.replace(existing, aside)
-                    moved_aside.append((aside, existing))
+            # Shape of the version being published (byte-identical to the
+            # verified backup), captured before the swap so that nothing
+            # fallible is left after the atomic rename.
+            with closing(
+                sqlite3.connect(
+                    f"file:{new_db.as_posix()}?mode=ro&immutable=1", uri=True
+                )
+            ) as conn:
+                count, max_id = conn.execute(
+                    "SELECT COUNT(*), MAX(id) FROM job_logs"
+                ).fetchone()
 
-            os.replace(new_db, target_path)
-            _fsync_dir(target_path.parent)
+            if after_prepare is not None:
+                after_prepare()
 
-            # The old copy is no longer needed once the swap succeeded.
-            for aside, _ in moved_aside:
-                try:
-                    aside.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            moved_aside = []
-            _remove_sidecars(target_path)
-            _fsync_dir(target_path.parent)
-        except BaseException:
-            # Put the previous target back, bit for bit.
-            if target_path.exists() and moved_aside:
-                try:
-                    target_path.unlink()
-                except OSError:
-                    pass
-            restored_old = True
-            for aside, original in moved_aside:
-                try:
-                    os.replace(aside, original)
-                except OSError:
-                    restored_old = False
-            if restored_old:
+            # Publish.  Serialised per target: the existence check and the
+            # swap form one critical section, so two racing restores cannot
+            # both pass a no-overwrite check, and a failure here only ever
+            # affects the private staging copy -- never the live target.
+            with self._target_lock(target_path):
+                if target_path.exists() and target_path.is_dir():
+                    raise RestoreError("target path is an existing directory")
+                if target_path.exists() and not overwrite:
+                    raise TargetExistsError(
+                        f"target already exists: {target_path}"
+                    )
+                if before_publish is not None:
+                    before_publish()
+                # Sidecars of a previous target (e.g. a leftover -journal from
+                # an external writer) must not survive the swap: SQLite would
+                # replay them against the new file.  The service itself only
+                # ever reads targets and never creates sidecars on them.
+                _remove_sidecars(target_path)
+                # Atomic rename: readers see either the old complete version
+                # or the new one, never a missing or half-copied file.
+                os.replace(new_db, target_path)
                 _fsync_dir(target_path.parent)
+        except BaseException:
+            # Only the private staging directory is cleaned up.  The live
+            # target -- the previous version, or one published by a
+            # concurrent restore -- is never removed or rolled back.
             shutil.rmtree(work_dir, ignore_errors=True)
             raise
         else:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-        with closing(
-            sqlite3.connect(f"file:{target_path.as_posix()}?mode=ro", uri=True)
-        ) as conn:
-            count, max_id = conn.execute(
-                "SELECT COUNT(*), MAX(id) FROM job_logs"
-            ).fetchone()
         return RestoreResult(
             backup_id=backup_id,
             target_path=target_path.as_posix(),
